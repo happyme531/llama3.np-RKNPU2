@@ -1,21 +1,91 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 import time
 from typing import TypeVar, Generic, Optional
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np
+import cv2
 
 from config import ModelArgs
 from tokenizer import Tokenizer
 from utils import load_parameters
+
+from rknn_matmul import RKNNMatMul, RKNNTensorType
 
 Shape = TypeVar("Shape")
 
 
 class Array(np.ndarray, Generic[Shape]): ...
 
+import numpy as np
+import os
+
+def visualize_array(arr, save_path, normalize=True, cmap=cv2.COLORMAP_TWILIGHT):
+    """
+    将形状为(1,w,h)或(w,h)的numpy数组保存为图像文件
+    
+    参数:
+        arr: numpy数组,形状为(1,w,h)或(w,h)
+        save_path: 图像保存路径,支持.png/.jpg等格式
+        normalize: 是否将数据归一化到[0,1]范围
+        cmap: OpenCV颜色映射方案,默认为COLORMAP_VIRIDIS
+        dpi: 图像分辨率,默认300
+    """
+    # 确保输入是numpy数组
+    arr = np.asarray(arr)
+    
+    # 处理维度
+    arr = np.squeeze(arr)  # 移除大小为1的维度
+    
+    # 归一化到0-255范围
+    if normalize:
+        arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+    arr_norm = (arr * 255).astype(np.uint8)
+    
+    # 应用颜色映射
+    colored = cv2.applyColorMap(arr_norm, cmap)
+    
+    # 创建colorbar
+    colorbar_width = 30
+    colorbar = np.linspace(0, 255, colored.shape[0]).astype(np.uint8)
+    colorbar = np.tile(colorbar[:, np.newaxis], (1, colorbar_width))
+    colorbar = cv2.applyColorMap(colorbar, cmap)
+    
+    # 添加值标签
+    if normalize:
+        min_val, max_val = 0, 1
+    else:
+        min_val, max_val = arr.min(), arr.max()
+    
+    # 合并图像和colorbar
+    padding = np.zeros((colored.shape[0], 20, 3), dtype=np.uint8)  # 添加间距
+    result = np.hstack([colored, padding, colorbar])
+    
+    # 添加文本标签
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.4
+    cv2.putText(result, f'{max_val:.2f}', 
+                (colored.shape[1] + padding.shape[1] - 10, 20), 
+                font, font_scale, (255,255,255), 1)
+    cv2.putText(result, f'{min_val:.2f}', 
+                (colored.shape[1] + padding.shape[1] - 10, result.shape[0] - 10), 
+                font, font_scale, (255,255,255), 1)
+    
+    # 确保保存路径的目录存在
+    os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+    
+    # 保存图像
+    cv2.imwrite(save_path, result)
+
+def compute_error(a, b):
+    abs_diff = np.abs(a - b)
+    max_error = np.max(abs_diff)
+    mean_error = np.mean(abs_diff)
+    print(f"max_error: {max_error}, mean_error: {mean_error}")
 
 def softmax(x):
     exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True)).astype(np.float32)
@@ -83,13 +153,21 @@ class FeedForward:
         self.up_weight = up_weight.T
         self.gate_weight = gate_weight.T
         self.down_weight = down_weight.T
+        self.mm_gate = RKNNMatMul()
+        self.mm_up = RKNNMatMul()
+        self.mm_down = RKNNMatMul()
 
     def __call__(self, x: Array["B, L or 1, D"]):
         # FD = 2 * 4 * D / 3
-        swish: Array["B, L or 1, FD"] = silu(x @ self.gate_weight)
-        x_V: Array["B, L or 1, FD"] = x @ self.up_weight
-        x: Array["B, L or 1, FD"] = swish * x_V
-        x: Array["B, L or 1, D"] = x @ self.down_weight
+        # swish: Array["B, L or 1, FD"] = silu(x @ self.gate_weight)
+        # x_V: Array["B, L or 1, FD"] = x @ self.up_weight
+        # x: Array["B, L or 1, FD"] = swish * x_V
+        # x: Array["B, L or 1, D"] = x @ self.down_weight
+        gate = self.mm_gate.matmul(x, self.gate_weight, RKNNTensorType.RKNN_TENSOR_FLOAT32, const_b=True, b_native_layout=True)
+        swish = silu(gate)
+        x_V = self.mm_up.matmul(x, self.up_weight, RKNNTensorType.RKNN_TENSOR_FLOAT32, const_b=True, b_native_layout=True)
+        x = swish * x_V
+        x = self.mm_down.matmul(x, self.down_weight, RKNNTensorType.RKNN_TENSOR_FLOAT32, const_b=True, b_native_layout=True)
         return x
 
 
@@ -119,6 +197,11 @@ class Attention:
         self.v_weight = v_weight.T
         self.o_weight = o_weight.T
 
+        self.mm_q = RKNNMatMul()
+        self.mm_k = RKNNMatMul()
+        self.mm_v = RKNNMatMul()
+        self.mm_o = RKNNMatMul()
+
         self.cache_k = np.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim), dtype=np.float32)
         self.cache_v = np.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim), dtype=np.float32)
 
@@ -127,9 +210,12 @@ class Attention:
         B, L, _ = x.shape
 
         # QKV
-        xq: Array["B, L or 1, D"] = x @ self.q_weight
-        xk: Array["B, L or 1, D"] = x @ self.k_weight
-        xv: Array["B, L or 1, D"] = x @ self.v_weight
+        # xq: Array["B, L or 1, D"] = x @ self.q_weight
+        # xk: Array["B, L or 1, D"] = x @ self.k_weight
+        # xv: Array["B, L or 1, D"] = x @ self.v_weight
+        xq = self.mm_q.matmul(x, self.q_weight, RKNNTensorType.RKNN_TENSOR_FLOAT32, const_b=True, b_native_layout=True)
+        xk = self.mm_k.matmul(x, self.k_weight, RKNNTensorType.RKNN_TENSOR_FLOAT32, const_b=True, b_native_layout=True)
+        xv = self.mm_v.matmul(x, self.v_weight, RKNNTensorType.RKNN_TENSOR_FLOAT32, const_b=True, b_native_layout=True)
 
         xq: Array["B, L or 1, QHN,  HD"] = xq.reshape(B, L, self.n_local_heads, self.head_dim)
         xk: Array["B, L or 1, KVHN, HD"] = xk.reshape(B, L, self.n_local_kv_heads, self.head_dim)
@@ -165,7 +251,8 @@ class Attention:
 
         # ["B, HN, L or 1, HD"] -> ["B, L or 1, D"]
         output: Array["B, L or 1, D"] = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        output: Array["B, L or 1, D"] = output @ self.o_weight
+        # output: Array["B, L or 1, D"] = output @ self.o_weight
+        output = self.mm_o.matmul(output, self.o_weight, RKNNTensorType.RKNN_TENSOR_FLOAT32, const_b=True, b_native_layout=True)
 
         return output
 
@@ -228,6 +315,8 @@ class Llama:
         # self.lm_head_weight: Array["D, VS"] = weight.get("lm_head.weight").T
         self.lm_head_weight: Array["D, VS"] = self.tok_embedding.T
 
+        self.mm_lm_head = RKNNMatMul(iommu_domain_id=1)
+
         del weight
 
     def __call__(self, input_ids: Array["B, L"], start_pos: int):
@@ -252,7 +341,8 @@ class Llama:
         h: Array["B, L or 1, D"] = self.norm(h)
         # Only forward the output from the last position.
         # ["B, 1, VS"] = ["B, 1(L), D"] @ ["D, VS"]
-        logit: Array["B, 1, VS"] = h[:, [-1], :] @ self.lm_head_weight
+        # logit: Array["B, 1, VS"] = h[:, [-1], :] @ self.lm_head_weight
+        logit = self.mm_lm_head.matmul(h, self.lm_head_weight, RKNNTensorType.RKNN_TENSOR_FLOAT32, const_b=True, b_native_layout=True)
         return logit
 
     def generate(self, input_ids: Array["B, L"], max_new_tokens: int):
@@ -284,8 +374,6 @@ class Llama:
 
 
 from transformers import AutoTokenizer
-import os
-
 def main():
     args = ModelArgs()
 
@@ -294,16 +382,18 @@ def main():
     model = Llama("/mnt/ssd1/home/user/llama3.2-1b.npz", args)
 
     if len(sys.argv) == 1:
-        prompt = "Here is a python script of QuickSort algorithm:\n```python"
+        prompt = "Here is a python script of a algorithm QuickSort algorithm: \n```python"
     else:
         prompt = sys.argv[1]
 
     print(f"\n{prompt}", end="")
     input_ids = np.array([tokenizer.encode(prompt)])
     # print(input_ids)
-    start = time.time()
+    start = None
     _, L = input_ids.shape
     for id in model.generate(input_ids, args.max_new_tokens):
+        if L == input_ids.shape[1] + 1:
+            start = time.time()
         L += 1
         output_id = id.item()
         if output_id in [128001, 128008, 128009]:
@@ -311,9 +401,9 @@ def main():
         print(tokenizer.decode([output_id]), end="")
         sys.stdout.flush()
     elapsed = time.time() - start
+    L -= input_ids.shape[1]
     print(f"\n\nToken count: {L}, elapsed: {elapsed:.2f}s, {round(L / elapsed)} tokens/s")
 
 import cProfile
-os.chdir(os.path.dirname(os.path.abspath(__file__)))
 # cProfile.run('main()', sort='tottime')
 main()

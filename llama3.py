@@ -18,53 +18,56 @@ class Array(np.ndarray, Generic[Shape]): ...
 
 
 def softmax(x):
-    exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True))
+    exp_x = np.exp(x - np.max(x, axis=-1, keepdims=True)).astype(np.float32)
     return exp_x / np.sum(exp_x, axis=-1, keepdims=True)
 
 
 def silu(x):
-    return x * (1 / (1 + np.exp(-x)))
+    return x * (1.0 / (1.0 + np.exp(-x))).astype(np.float32)
 
 
-def compute_cos_sin_cache(head_dim: int, max_seq_len: int, base: int = 10000):
-    inv_freq: Array["HD//2"] = 1.0 / (base ** (np.arange(0, head_dim, 2)[: (head_dim // 2)] / head_dim))
-    t: Array["M"] = np.arange(max_seq_len)
-    freqs: Array["M, HD//2"] = np.outer(t, inv_freq)
+def rotate_half(x: Array["..., D"]):
+    """Rotates half the hidden dims of the input."""
+    d = x.shape[-1]
+    x1, x2 = np.split(x, 2, axis=-1) 
+    return np.concatenate((-x2, x1), axis=-1)
 
-    return np.cos(freqs), np.sin(freqs)
+
+def compute_cos_sin_cache(head_dim: int, max_seq_len: int, base: int = 500000):
+    """
+    Compute cos and sin cache for rotary embeddings.
+    Aligned with PyTorch version's default RoPE implementation.
+    """
+    # Compute inverse frequency bands
+    inv_freq = (1.0 / (base ** (np.arange(0, head_dim, 2, dtype=np.float32) / head_dim)))
+    
+    # Compute position frequencies 
+    t = np.arange(max_seq_len, dtype=np.float32)
+    freqs = np.outer(t, inv_freq)  # [seq_len, head_dim//2]
+    
+    # Compute cos and sin and duplicate to match full head_dim
+    cos = np.cos(freqs)  # [seq_len, head_dim//2]
+    sin = np.sin(freqs)  # [seq_len, head_dim//2]
+    cos = np.concatenate([cos, cos], axis=1)  # [seq_len, head_dim]
+    sin = np.concatenate([sin, sin], axis=1)  # [seq_len, head_dim]
+    
+    return cos.astype(np.float32), sin.astype(np.float32)
 
 
-def apply_rotary_emb(xq: Array["B, L or 1, QHN,  HD"], xk: Array["B, L or 1, KVHN, HD"],
-                     freqs_cos: Array["L or 1, HD//2"], freqs_sin: Array["L or 1, HD//2"]):
-    # ["B, L or 1, QHN, HD"] -> ["B, L or 1, QHN,  HD//2, 2"]
-    xqri: Array["B, L or 1, QHN,  HD//2, 2"] = xq.reshape(xq.shape[:-1] + (-1, 2))
-    xkri: Array["B, L or 1, KVHN, HD//2, 2"] = xk.reshape(xk.shape[:-1] + (-1, 2))
-
-    # Reshape `xq` and `xk` to match the complex representation.
-    xq_r, xq_i = np.split(xqri, 2, axis=-1)
-    xq_r: Array["B, L or 1, QHN,  HD//2"] = xq_r.squeeze(-1)
-    xq_i: Array["B, L or 1, QHN,  HD//2"] = xq_i.squeeze(-1)
-
-    xk_r, xk_i = np.split(xkri, 2, axis=-1)
-    xk_r: Array["B, L or 1, KVHN, HD//2"] = xk_r.squeeze(-1)
-    xk_i: Array["B, L or 1, KVHN, HD//2"] = xk_i.squeeze(-1)
-
-    # Reshape `freqs_cos` and `freqs_sin` for broadcasting.
-    freqs_cos: Array["B, L or 1, 1, HD//2"] = np.expand_dims(freqs_cos, axis=(0, 2))
-    freqs_sin: Array["B, L or 1, 1, HD//2"] = np.expand_dims(freqs_sin, axis=(0, 2))
-
-    # Apply rotation using real numbers.
-    xq_out_r: Array["B, L or 1, QHN,  HD//2"] = xq_r * freqs_cos - xq_i * freqs_sin
-    xq_out_i: Array["B, L or 1, QHN,  HD//2"] = xq_r * freqs_sin + xq_i * freqs_cos
-    xk_out_r: Array["B, L or 1, KVHN, HD//2"] = xk_r * freqs_cos - xk_i * freqs_sin
-    xk_out_i: Array["B, L or 1, KVHN, HD//2"] = xk_r * freqs_sin + xk_i * freqs_cos
-
-    # Flatten last two dimensions.
-    xq_out: Array["B, L or 1, QHN,  HD//2, 2"] = np.stack([xq_out_r, xq_out_i], axis=-1)
-    xk_out: Array["B, L or 1, KVHN, HD//2, 2"] = np.stack([xk_out_r, xk_out_i], axis=-1)
-    xq_out: Array["B, L or 1, QHN,  HD"] = xq_out.reshape(xq_out.shape[:-2] + (-1,))
-    xk_out: Array["B, L or 1, KVHN, HD"] = xk_out.reshape(xk_out.shape[:-2] + (-1,))
-
+def apply_rotary_emb(xq: Array["B, L or 1, QHN, HD"], xk: Array["B, L or 1, KVHN, HD"],
+                     freqs_cos: Array["L or 1, HD"], freqs_sin: Array["L or 1, HD"]):
+    """
+    Apply rotary embeddings to query and key tensors.
+    Aligned with PyTorch version's apply_rotary_pos_emb function.
+    """
+    # Add missing broadcast dimensions to match PyTorch version
+    freqs_cos = np.expand_dims(freqs_cos, axis=(0, 2))  # [1, seq_len, 1, head_dim]
+    freqs_sin = np.expand_dims(freqs_sin, axis=(0, 2))  # [1, seq_len, 1, head_dim]
+    
+    # Apply rotation using the helper function
+    xq_out = (xq * freqs_cos) + (rotate_half(xq) * freqs_sin)
+    xk_out = (xk * freqs_cos) + (rotate_half(xk) * freqs_sin)
+    
     return xq_out, xk_out
 
 
@@ -92,13 +95,13 @@ class FeedForward:
 
 class RMSNorm:
     def __init__(self, weight: Array["H"], eps: float):
-        self.weight = weight
-        self.eps = eps
+        self.weight = weight.astype(np.float32)
+        self.eps = np.float32(eps)
 
     def __call__(self, x: Array["B, L or 1, D"]):
-        z: Array["B, L or 1, 1"] = (x ** 2).mean(-1, keepdims=True) + self.eps
-        z: Array["B, L or 1, D"] = x / np.sqrt(z)
-        return z * self.weight
+        z = (x ** 2).mean(-1, keepdims=True).astype(np.float32) + self.eps
+        z = x / np.sqrt(z)
+        return (z * self.weight).astype(np.float32)
 
 
 class Attention:
@@ -116,11 +119,11 @@ class Attention:
         self.v_weight = v_weight.T
         self.o_weight = o_weight.T
 
-        self.cache_k = np.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim))
-        self.cache_v = np.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim))
+        self.cache_k = np.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim), dtype=np.float32)
+        self.cache_v = np.zeros((args.max_batch_size, args.max_seq_len, self.n_local_kv_heads, self.head_dim), dtype=np.float32)
 
     def __call__(self, x: Array["B, L or 1, D"], start_pos: int, mask: Optional[Array["L, L"]],
-                 freqs_cos: Array["L or 1, HD//2"], freqs_sin: Array["L or 1, HD//2"]):
+                 freqs_cos: Array["L or 1, HD"], freqs_sin: Array["L or 1, HD"]):
         B, L, _ = x.shape
 
         # QKV
@@ -152,7 +155,8 @@ class Attention:
 
         # Scaled Dot-Product Attention
         # ["B, HN, L or 1, HD"] @ ["B, HN, HD, L"] -> ["B, HN, L or 1, L"]
-        attention: Array["B, HN, L or 1, L"] = xq @ xk.transpose(0, 1, 3, 2) / math.sqrt(self.head_dim)
+        attention: Array["B, HN, L or 1, L"] = xq @ xk.transpose(0, 1, 3, 2) / np.float32(math.sqrt(self.head_dim))
+        # np.savez("qka.npz", query_states=xq, key_states=xk, attn_weights=attention)
         # `mask` is used only once at the beginning.
         if mask is not None:
             attention = attention + mask[None, None, :, :]
@@ -190,7 +194,7 @@ class TransformerBlock:
         )
 
     def __call__(self, x: Array["B, L or 1, D"], start_pos: int, mask: Array["L, L"],
-                 freqs_cos: Array["L or 1, HD//2"], freqs_sin: Array["L or 1, HD//2"]):
+                 freqs_cos: Array["L or 1, HD"], freqs_sin: Array["L or 1, HD"]):
         # RMSNorm
         norm_x: Array["B, L or 1, D"] = self.input_layernorm(x)
         # Masked Multi-Head Attention
@@ -221,7 +225,8 @@ class Llama:
             self.layers.append(TransformerBlock(weight, layer_id, args))
 
         self.norm = RMSNorm(weight.get("model.norm.weight"), eps=args.norm_eps)
-        self.lm_head_weight: Array["D, VS"] = weight.get("lm_head.weight").T
+        # self.lm_head_weight: Array["D, VS"] = weight.get("lm_head.weight").T
+        self.lm_head_weight: Array["D, VS"] = self.tok_embedding.T
 
         del weight
 
@@ -229,15 +234,15 @@ class Llama:
         _, L = input_ids.shape
         h: Array["B, L or 1, D"] = self.tok_embedding[input_ids]
         # ["M, HD//2"] -> ["L or 1, HD//2"]
-        freqs_cos: Array["L or 1, HD//2"] = self.freqs_cos[start_pos: start_pos + L]
-        freqs_sin: Array["L or 1, HD//2"] = self.freqs_sin[start_pos: start_pos + L]
+        freqs_cos: Array["L or 1, HD"] = self.freqs_cos[start_pos: start_pos + L]
+        freqs_sin: Array["L or 1, HD"] = self.freqs_sin[start_pos: start_pos + L]
 
         # `mask` is generated only once at the beginning.
         mask: Array["L, L"] = None
         if L > 1:
-            mask = np.full((L, L), float("-inf"))
+            mask = np.full((L, L), np.float32('-inf'))
             mask = np.triu(mask, k=1)
-            mask = np.concatenate([np.zeros((L, start_pos)), mask], axis=1)
+            mask = np.concatenate([np.zeros((L, start_pos), dtype=np.float32), mask], axis=1)
 
         # Transformer Layers
         for i, layer in enumerate(self.layers):
@@ -252,39 +257,66 @@ class Llama:
 
     def generate(self, input_ids: Array["B, L"], max_new_tokens: int):
         _, L = input_ids.shape
-        for i, curr_pos in enumerate(range(L, max_new_tokens)):
+        for i, curr_pos in enumerate(range(L, L + max_new_tokens)):
             if i == 0:  # Prefill Phase
                 inputs = input_ids
                 pos = 0
             else:  # Decode Phase
-                inputs = next_id
+                inputs = next_id.reshape(1, -1)
                 pos = curr_pos
             logits: Array["B, 1, VS"] = self(inputs, pos)
-            next_id = logits[:, -1, :].argmax(-1, keepdims=True)
+            
+            # 添加温度采样
+            logits = logits / 0.7
+            probs = softmax(logits)
+            # 生成正确形状的 next_id
+            next_id = np.random.choice(
+                probs.shape[-1], 
+                size=1,
+                p=probs[0, -1]
+            ).reshape(1, 1)
+            
+            # 检查是否生成了任何结束标记
+            if next_id.item() in [128001, 128008, 128009]:  # 使用 item() 安全地获取标量值
+                break
+            
             yield next_id
 
 
-if __name__ == '__main__':
+from transformers import AutoTokenizer
+import os
+
+def main():
     args = ModelArgs()
 
-    tokenizer = Tokenizer("./tokenizer.model.np")
-    model = Llama("./stories15M.model.npz", args)
+    # tokenizer = Tokenizer("./tokenizer.model.np")
+    tokenizer = AutoTokenizer.from_pretrained("../llama3.2")
+    model = Llama("/mnt/ssd1/home/user/llama3.2-1b.npz", args)
 
     if len(sys.argv) == 1:
-        prompt = "I have a dream"
+        prompt = "Here is a python script of QuickSort algorithm:\n```python"
     else:
         prompt = sys.argv[1]
 
     print(f"\n{prompt}", end="")
     input_ids = np.array([tokenizer.encode(prompt)])
-    start = time.time()
+    # print(input_ids)
+    start = None
     _, L = input_ids.shape
     for id in model.generate(input_ids, args.max_new_tokens):
+        if start is None:
+            start = time.time()
         L += 1
-        output_id = id[0].tolist()
-        if output_id[-1] in [tokenizer.eos_id, tokenizer.bos_id]:
+        output_id = id.item()
+        if output_id in [128001, 128008, 128009]:
             break
-        print(tokenizer.decode(output_id), end="")
+        print(tokenizer.decode([output_id]), end="")
         sys.stdout.flush()
     elapsed = time.time() - start
+    L -= input_ids.shape[1]
     print(f"\n\nToken count: {L}, elapsed: {elapsed:.2f}s, {round(L / elapsed)} tokens/s")
+
+import cProfile
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+# cProfile.run('main()', sort='tottime')
+main()
